@@ -1,3 +1,5 @@
 discord.py
+numpy
 rapidfuzz
 tensorflow
+tensorflow_datasets

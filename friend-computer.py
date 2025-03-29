@@ -7,10 +7,11 @@ import os
 from pathlib import Path
 import pickle
 import rapidfuzz
-import random #TODO remove
+import random
 import re
 import sys
-# import tensorflow
+import tensorflow
+import tensorflow_datasets # needed by tokenizer.pickle, even though it looks unused
 
 # Read config, or generate default config if the file doesn't exist
 try:
@@ -61,23 +62,24 @@ except FileNotFoundError:
             "Please fill out the user-info.json file and restart the bot.")
 
 #TODO Initialize sentiment analysis models
-# try:
-#     with open(f"{sys.path[0]}/data/{config["nameTokenizer"]}", "rb") as file:
-#         tokenizer = pickle.load(file)
-#     h5Model = tensorflow.keras.models.load_model(f"{sys.path[0]}/data/{config["nameH5Model"]}")
-#     tfInterp = tensorflow.lite.Interpreter(f"{sys.path[0]}/data/{config["nameTfliteModel"]}")
-#     tfInput = tfInterp.get_input_details()
-#     tfOutput = tfInterp.get_output_details()
+try:
+    with open(f"{sys.path[0]}/data/{config['nameTokenizer']}", "rb") as file:
+        tokenizer = pickle.load(file)
+    # h5Model = tensorflow.keras.models.load_model(f"{sys.path[0]}/data/{config['nameH5Model']}")
+    tfInterp = tensorflow.lite.Interpreter(f"{sys.path[0]}/data/{config['nameTfliteModel']}")
+    tfInput = tfInterp.get_input_details()
+    tfOutput = tfInterp.get_output_details()
+    tfInterp.allocate_tensors()
 
-# except FileNotFoundError:
-#     filePath = Path(f"{sys.path[0]}/data/")
-#     filePath.parent.mkdir(exist_ok=True, parents=True)
-#     sys.exit(
-#         "Couldn't find the models and tokenizer in the data directory. Please make sure their "
-#         f"filenames in {sys.path[0]}/data/ match the values in the config file.")
+except FileNotFoundError:
+    filePath = Path(f"{sys.path[0]}/data/")
+    filePath.parent.mkdir(exist_ok=True, parents=True)
+    sys.exit(
+        "Couldn't find the models and tokenizer in the data directory. Please make sure their "
+        f"filenames in {sys.path[0]}/data/ match the values in the config file.")
 
-# except:
-#     sys.exit("Couldn't load the models and tokenizer in the data directory.")
+except Exception as e:
+    sys.exit(f"Couldn't load the models and tokenizer in the data directory: {e}")
 
 
 # Create discord client object, and set Guild_messages and Message_content intents to read messages
@@ -93,16 +95,17 @@ pingRole = {}
 
 @client.event
 async def on_ready() -> None:
-    """Load user credit from disk, and output the configured word lists."""
+    """Load user credit from disk, fetch the ping role to identify which users want to be pinged,
+    and output the configured word lists."""
     await readCreditFromDisk()
     global pingRole
     for guild in client.guilds:
         pingRole[guild] = discord.utils.get(guild.roles, name=config["pingRole"])
     print(f"Found the following ping roles for the following servers:\n{pingRole}\n")
     print(
-        f"Messages with these words invert sentiment analysis:\n{config["wordlistTreason"]}\n\n"
-        f"These messages will trigger the bot's time function:\n{config["wordlistTime"]}\n\n"
-        f"And these messages will trigger the bot's shouting function:\n{config["wordlistWhat"]}")
+        f"Messages with these words invert sentiment analysis:\n{config['wordlistTreason']}\n\n"
+        f"These messages will trigger the bot's time function:\n{config['wordlistTime']}\n\n"
+        f"And these messages will trigger the bot's shouting function:\n{config['wordlistWhat']}")
 
 
 @client.event
@@ -119,9 +122,10 @@ async def on_thread_create(thread: discord.Thread) -> None:
 
 @client.event
 async def on_message(msg: discord.Message) -> None:
-    """Trigger only on non-bot messages. First check if message starts with invoker, then check if
-    message hits on one of the word lists and handle accordingly. If it doesn't hit on any wordlist,
-    perform sentiment analysis and modify the author's score."""
+    """Trigger only on non-bot messages. First check if message starts with invoker, then do special
+    handling for replies that ping, and markdown-masked links. Then check for bot votes, or whether
+    message hits on one of the word lists, and handle accordingly. If it doesn't hit on a wordlist,
+    perform sentiment analysis and modify the author's credit."""
     if msg.author.bot:
         return
 
@@ -160,13 +164,19 @@ async def on_message(msg: discord.Message) -> None:
                 await client.close()
                 sys.exit(0)
 
-            elif command == "reboot":
-                await writeCreditToDisk()
-                await client.close()
-                os.system("sudo reboot")
+            #TODO other stuff is hosted on same system, so don't want to allow reboot.
+            # Maybe systemctl restart, or however else we can restart the bot?
+            # elif command == "reboot":
+            #     await writeCreditToDisk()
+            #     await client.close()
+            #     os.system("sudo reboot")
 
         if command.startswith("vibe"):
-            sentiment = sentimentAnalysis([_ async for _ in msg.channel.history(limit=2)][-1])
+            if msg.reference is not None:
+                trgt = await findVoteTarget(msg) # allow reply-vibing messages
+            else:
+                trgt = [_ async for _ in msg.channel.history(limit=2)][-1]
+            sentiment = sentimentAnalysis(trgt.content)
             await msg.reply(f"The prior message's sentiment is: {sentiment}", mention_author=False)
 
     # Penalize users who ping author when replying to messages sent within the last hour
@@ -182,7 +192,7 @@ async def on_message(msg: discord.Message) -> None:
     #             "Please don't ping when replying to recent messages, thanks! "
     #             "https://tenor.com/view/dont-reply-ping-reply-ping-reply-discord-reply-discord-gif-22725442",
     #             mention_author=True)
-    #         # silently penalize credit, so people maxxing negative scores don't spam this
+    #         # silently penalize credit, so people maxxing negative credit don't spam this
     #         await updateCredit(msg.author.id, credit=-10, treason=1)
 
     # De-obscure links first, forgoing all other features (we want to discourage hiding links)
@@ -190,7 +200,7 @@ async def on_message(msg: discord.Message) -> None:
     if linkSearch and linkSearch.group(3) != "discord.com":
         await msg.reply(
             "Please don't mask links with markdown in this server, thanks!", mention_author=True)
-        # silently penalize credit, so people maxxing negative scores don't spam this
+        # silently penalize credit, so people maxxing negative credit don't spam this
         await updateCredit(msg.author.id, credit=-10, treason=1)
 
     # Check good/bad/"any" bots - can have any leading/trailing words as long as 2nd one is "bot"
@@ -199,7 +209,9 @@ async def on_message(msg: discord.Message) -> None:
             len(splitL) == 2 and splitL[0] in ["good", "bad", "medium"]):
         # Let sentiment analysis decide whether vote is positive or negative
         sentiment = sentimentAnalysis(msg.content)
-        # good/bad bots are likely to be +/-2 or 3 credit base, so add 5x mult before channel mult
+        # good/bad bots are worth +/-3 credit base, so add 5x mult before channel mult
+        # so manual votes are worth 15 credit before channel mult. This still seems kinda devalued
+        # compared to Sbeve votes, but there's no vote limit now so maybe it balances out
         credit = convertSentiment(sentiment) * 5 * creditMult
         target = await findVoteTarget(msg)
         if target is not None:
@@ -270,9 +282,9 @@ async def on_message(msg: discord.Message) -> None:
             await writeCreditToDisk()
 
 
-def sentimentAnalysis(content: str) -> float: #TODO docstring, testing
-    """Returns sentiment rather than credit, so that manual vibe checks can be invoked by users."""
-    return random.random()*1.2 # positive bias for testing (realistic?), TODO remove
+def sentimentAnalysis(content: str) -> float: #TODO testing
+    """Analyzes sentiment of {content}, which is a float between 0 (negative) and 1 (positive).
+    The ^vibe command outputs this value, and convertSentiment (into credit) uses this as input."""
     tokenizedInput = numpy.array([tokenizer.encode(content)], dtype=numpy.int32)
     tokenizedInput = tensorflow.keras.preprocessing.sequence.pad_sequences(
         tokenizedInput, value=0, padding="post", maxlen=73)
@@ -280,9 +292,9 @@ def sentimentAnalysis(content: str) -> float: #TODO docstring, testing
     tfInterp.set_tensor(tfInput[0]["index"], tokenizedInput)
     tfInterp.invoke()
     tfSent = tfInterp.get_tensor(tfOutput[0]["index"])
-    h5Sent = h5Model(tokenizedInput, training=False).numpy()
+    # h5Sent = h5Model(tokenizedInput, training=False).numpy()
 
-    return (tfSent, h5Sent)
+    return tfSent
 
 
 def convertSentiment(sentiment: float) -> int:
@@ -303,8 +315,13 @@ def convertSentiment(sentiment: float) -> int:
 
 
 async def findVoteTarget(msg: discord.Message) -> discord.Message | None: #TODO testing
-    # Allow vote-replying to prior messages, if target was sent on/after the prior calendar day.
-    # Subsequent chained (non-reply) votes will continue to vote on that target message
+    """Given {msg}, find the target message that {msg} is voting on. If {msg} is a reply, then
+    this is very easy, but limit voting in this way to messages sent within the past day, and only
+    once, to avoid infinite vote chains on the same message or on all prior messages sent by a user.
+
+    If {msg} is not a reply, look through channel history for the first message that isn't a bot
+    response to a vote, nor is another user voting the same message."""
+    # Implement vote-replying, and subsequent chained votes will continue to vote on the same target
     if msg.reference is not None:
         trgtMsg = await msg.channel.fetch_message(msg.reference.message_id)
         if trgtMsg.created_at.day >= msg.created_at.day - 1 and not any(
@@ -361,12 +378,14 @@ async def findVoteTarget(msg: discord.Message) -> discord.Message | None: #TODO 
     return None # Only get here if the history limit is reached, or multiple users are reply-voting
 
 
-def getAuthorMember(msg: discord.Message) -> discord.Member: #TODO docstring
-    # This is super dumb but apparently required in a server config where many channels are private
+def getAuthorMember(msg: discord.Message) -> discord.Member:
+    """Given a message, return the discord.Member object representing the message's author.
+    Needed because in private channels, msg.author returns a User instead of a Member,
+    but other parts of the code need the additional fields that Member contains."""
     return msg.guild.get_member(msg.author.id)
 
 
-async def updateCredit(userID: int, credit: int=0, treason: int=0, name: str=None) -> None: #TODO testing
+async def updateCredit(userID: int, credit: int=0, treason: int=0, name: str=None) -> None:
     """Update user social credit in async-safe way. {credit} should be a positive or negative
     integer - the amount by which to modify the user's social credit. Likewise for {treason}."""
     userID = str(userID) # Convert to string, because the keys in the stats file are all strings
