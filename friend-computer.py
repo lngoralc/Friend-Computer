@@ -6,12 +6,14 @@ import numpy
 import os
 from pathlib import Path
 import pickle
-import rapidfuzz
+from rapidfuzz import fuzz
 import random
 import re
 import sys
-import tensorflow
+# import tensorflow
+from tensorflow import keras
 import tensorflow_datasets # needed by tokenizer.pickle, even though it looks unused
+import ai_edge_litert.interpreter
 
 # Read config, or generate default config if the file doesn't exist
 try:
@@ -66,7 +68,7 @@ try:
     with open(f"{sys.path[0]}/data/{config['nameTokenizer']}", "rb") as file:
         tokenizer = pickle.load(file)
     # h5Model = tensorflow.keras.models.load_model(f"{sys.path[0]}/data/{config['nameH5Model']}")
-    tfInterp = tensorflow.lite.Interpreter(f"{sys.path[0]}/data/{config['nameTfliteModel']}")
+    tfInterp = ai_edge_litert.interpreter.Interpreter(f"{sys.path[0]}/data/{config['nameTfliteModel']}")
     tfInput = tfInterp.get_input_details()
     tfOutput = tfInterp.get_output_details()
     tfInterp.allocate_tensors()
@@ -265,7 +267,7 @@ async def on_message(msg: discord.Message) -> None:
         # Use fuzzy matching on treason wordlist, apparently it only takes 4ms for >2000-char msg
         # to be checked against a list of 10 treasonous words on gamer rig
         fuzzlist = [
-            rapidfuzz.fuzz.ratio(word, msgWord) > 80
+            fuzz.ratio(word, msgWord) > 80
             for msgWord in splitL for word in config["wordlistTreason"]]
         treasonCount = fuzzlist.count(True)
         if treasonCount > 0:
@@ -289,7 +291,7 @@ def sentimentAnalysis(content: str) -> float: #TODO testing
     """Analyzes sentiment of {content}, which is a float between 0 (negative) and 1 (positive).
     The ^vibe command outputs this value, and convertSentiment (into credit) uses this as input."""
     tokenizedInput = numpy.array([tokenizer.encode(content)], dtype=numpy.int32)
-    tokenizedInput = tensorflow.keras.preprocessing.sequence.pad_sequences(
+    tokenizedInput = keras.preprocessing.sequence.pad_sequences(
         tokenizedInput, value=0, padding="post", maxlen=73)
 
     tfInterp.set_tensor(tfInput[0]["index"], tokenizedInput)
@@ -329,9 +331,15 @@ async def findVoteTarget(msg: discord.Message) -> discord.Message | None: #TODO 
         trgtMsg = await msg.channel.fetch_message(msg.reference.message_id)
         if trgtMsg.created_at.day >= msg.created_at.day - 1 and not any(
                 reaction.me for reaction in trgtMsg.reactions):
-            # add a reaction to target to track reply-vote usage, then return it
-            await trgtMsg.add_reaction("\N{eye}")
-            return trgtMsg
+            # Reply-voting bypasses voting-on-self guards, so check it here
+            if trgtMsg.author.id == msg.author.id:
+                #TODO await msg.reply(
+                    # "You can only vote on messages sent by other users!", mention_author=False)
+                return None
+            else:
+                # add a reaction to target to track reply-vote usage, then return it
+                await trgtMsg.add_reaction("\N{eye}")
+                return trgtMsg
         else:
             #TODO await msg.reply(
             #     "You can only vote via reply on messages sent since 12 AM yesterday, and messages "
@@ -371,8 +379,19 @@ async def findVoteTarget(msg: discord.Message) -> discord.Message | None: #TODO 
                 # If trgtMsg is NOT a vote or response, the parent block doesn't enter, so we can
                 # still vote on messages that happen to be replies (and not their reference message)
                 elif derefMsg is not None:
-                    return derefMsg
+                    # Follow-up votes on a reply-vote bypass voting-on-self guards, so check it here
+                    if derefMsg.author.id == msg.author.id:
+                        #TODO await msg.reply(
+                            # "You can only vote on messages sent by other users!",
+                            # mention_author=False)
+                        return None
+                    else:
+                        return derefMsg
 
+                continue
+
+            # Skip the author's own messages, so they can talk and then vote on the prior message
+            elif trgtMsg.author.id == msg.author.id:
                 continue
 
             else:
