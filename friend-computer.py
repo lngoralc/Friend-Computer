@@ -61,7 +61,7 @@ except FileNotFoundError:
             "Bot info file not found. A template has been created at config/user-info.json. "
             "Please fill out the user-info.json file and restart the bot.")
 
-#TODO Initialize sentiment analysis models
+# Initialize sentiment analysis models
 try:
     with open(f"{sys.path[0]}/data/{config['nameTokenizer']}", "rb") as file:
         tokenizer = pickle.load(file)
@@ -91,6 +91,7 @@ client = discord.Client(
 # Create userData dict to keep track of user credit and treason stars, and corresponding mutex
 userData = {}
 dataLock = asyncio.Lock()
+# Also the ping role, which indicates which users are okay with being pinged
 pingRole = {}
 
 @client.event
@@ -134,7 +135,7 @@ async def on_message(msg: discord.Message) -> None:
     now = msg.created_at.astimezone() # convert to local tz
 
     # Set multiplier for how much user social credit is modified by, depending on the channel
-    # An active "good"/"bad" bot generally counts as 10 credit
+    # An active "good"/"bad" bot counts as 15 credit, before mults
     if msg.channel.name == "shitposts": # everyone likes memes
         creditMult = 2
     elif msg.channel.name == "politics": # spicy
@@ -164,12 +165,12 @@ async def on_message(msg: discord.Message) -> None:
                 await client.close()
                 sys.exit(0)
 
-            #TODO other stuff is hosted on same system, so don't want to allow reboot.
-            # Maybe systemctl restart, or however else we can restart the bot?
-            # elif command == "reboot":
-            #     await writeCreditToDisk()
-            #     await client.close()
-            #     os.system("sudo reboot")
+            # Other stuff is hosted on same system, so don't want to allow reboot.
+            # Systemctl restart for the bot's service should do the trick
+            elif command == "restart":
+                await writeCreditToDisk()
+                await client.close()
+                os.system("sudo systemctl restart friend-computer.service")
 
         if command.startswith("vibe"):
             if msg.reference is not None:
@@ -189,7 +190,7 @@ async def on_message(msg: discord.Message) -> None:
     #     if not refMsg.author.bot and refMsg.author == msg.mentions[0] and (
     #             pingRole[msg.guild] not in refMsg.author.roles) and 300 <= elapsed <= 3600:
     #         await msg.reply(
-    #             "Please don't ping when replying to recent messages, thanks! "
+    #             "FYI, this user doesn't want to be pinged when they're replied to! "
     #             "https://tenor.com/view/dont-reply-ping-reply-ping-reply-discord-reply-discord-gif-22725442",
     #             mention_author=True)
     #         # silently penalize credit, so people maxxing negative credit don't spam this
@@ -199,7 +200,8 @@ async def on_message(msg: discord.Message) -> None:
     linkSearch = re.search(r"\[(.+)\]\((\w+://)((?:[a-z0-9-]+\.)+\w+)(.*)\)", contentL)
     if linkSearch and linkSearch.group(3) != "discord.com":
         await msg.reply(
-            "Please don't mask links with markdown in this server, thanks!", mention_author=True)
+            "Please don't mask links with markdown in this server, thanks! That link leads to "
+            f"{linkSearch.group(3)}{linkSearch.group(4)}", mention_author=True)
         # silently penalize credit, so people maxxing negative credit don't spam this
         await updateCredit(msg.author.id, credit=-10, treason=1)
 
@@ -261,7 +263,7 @@ async def on_message(msg: discord.Message) -> None:
     else:
         # Invert if discussing treasonous things (saying bad things about bad things is now good)
         # Use fuzzy matching on treason wordlist, apparently it only takes 4ms for >2000-char msg
-        # to be checked against a list of 10 treasonous words on gamer rig #TODO confirm Pi performance
+        # to be checked against a list of 10 treasonous words on gamer rig
         fuzzlist = [
             rapidfuzz.fuzz.ratio(word, msgWord) > 80
             for msgWord in splitL for word in config["wordlistTreason"]]
@@ -273,11 +275,12 @@ async def on_message(msg: discord.Message) -> None:
         # Get base message sentiment and credit value, and modify user's credit
         sentiment = sentimentAnalysis(msg.content)
         credit = convertSentiment(sentiment) * creditMult
-        await updateCredit(msg.author.id, credit=credit, treason=min(1, treasonCount))
+        await updateCredit(
+            msg.author.id, credit=credit, treason=min(1, treasonCount),
+            date=now.strftime("%Y-%m-%d"))
 
         # roughly 10% chance to save current data to disk, in case of power failure, etc.
         # yes i know it's not actually a 10% chance due to message IDs being snowflakes but shhh
-        # and also it's a 10% chance only for messages that actually reach this else-block
         if msg.id % 10 == 0:
             await writeCreditToDisk()
 
@@ -385,9 +388,12 @@ def getAuthorMember(msg: discord.Message) -> discord.Member:
     return msg.guild.get_member(msg.author.id)
 
 
-async def updateCredit(userID: int, credit: int=0, treason: int=0, name: str=None) -> None:
+async def updateCredit(
+    userID: int, credit: int=0, treason: int=0, name: str=None, date: str=None) -> None:
     """Update user social credit in async-safe way. {credit} should be a positive or negative
-    integer - the amount by which to modify the user's social credit. Likewise for {treason}."""
+    integer - the amount by which to modify the user's social credit. Likewise for {treason}.
+    {name} and {date} are purely informational fields, which get populated over time, to help
+    users read the stats file and make sense of it at a glance."""
     userID = str(userID) # Convert to string, because the keys in the stats file are all strings
     async with dataLock:
         global userData
@@ -397,6 +403,8 @@ async def updateCredit(userID: int, credit: int=0, treason: int=0, name: str=Non
         userData[userID]["treason"] += treason
         if name is not None:
             userData[userID]["name"] = name
+        if date is not None:
+            userData[userID]["lastUpdate"] = date
 
 
 async def readCreditFromDisk() -> None:
