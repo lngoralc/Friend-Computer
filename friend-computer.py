@@ -214,7 +214,7 @@ async def on_message(msg: discord.Message) -> None:
             await msg.reply(
                 "FYI, this user doesn't want to be pinged when you Reply to their messages! "
                 "https://tenor.com/view/discord-gif-9382638485807678151", mention_author=True)
-            # one automatic but silent bad bot, so people maxxing negative credit don't spam this
+            # one auto silent bad bot, so people maxxing negative credit don't spam this
             await updateCredit(msg.author.id, credit=-15, treason=1)
 
     # De-obscure links first, forgoing all other features (we want to discourage hiding links)
@@ -223,8 +223,8 @@ async def on_message(msg: discord.Message) -> None:
         await msg.reply(
             "Please don't mask links with markdown in this server, thanks! That link leads to "
             f"{linkSearch.group(3)}{linkSearch.group(4)}", mention_author=True)
-        # silently penalize credit, so people maxxing negative credit don't spam this
-        await updateCredit(msg.author.id, credit=-10, treason=1)
+        # one auto silent bad bot, so people maxxing negative credit don't spam this
+        await updateCredit(msg.author.id, credit=-15, treason=1)
 
     # Check good/bad/"any" bots - can have any leading/trailing words as long as 2nd one is "bot"
     # Or can start with "good"/"bad"/"medium" and have precisely one trailing word
@@ -240,7 +240,7 @@ async def on_message(msg: discord.Message) -> None:
         if target is not None:
             name = getAuthorMember(target).nick
             await updateCredit(target.author.id, credit=credit, name=name)
-            # if quietRole[msg.guild] in target.author.roles:
+            #TODO if quietRole[msg.guild] in target.author.roles:
             #     await target.channel.send(
             #         f"Thank you for voting on {name}! "
             #         f"They now have {userData[target.author.id]["credit"]} social credit.")
@@ -251,7 +251,8 @@ async def on_message(msg: discord.Message) -> None:
 
     # Scan for short message triggers, if present handle those and return without further processing
     # Also results in messages needing to be a minimum length of 25 chars for sentiment analysis.
-    elif len(contentL) <= 25:
+    # Exclude messages of 0 length since Discord considers some system/thread messages as 0-length
+    elif 1 <= len(contentL) <= 25:
         strippedContent = contentL.strip("^?!")
         if strippedContent in config["wordlistTime"]:
             if now.strftime("%a") == "Wed":
@@ -262,10 +263,8 @@ async def on_message(msg: discord.Message) -> None:
 
         # If stripped msg is in the what wordlist or is empty, trigger bot's "what" response
         # Exclude messages with embeds/attachments/references as user might be reacting to those
-        # And empty msgs in threads because Discord used some jank workaround on thread creation apparently that results in the first message being considered empty lmao
-        elif len(msg.attachments) == 0 and len(msg.embeds) == 0 and msg.reference is None and(
-                strippedContent in config["wordlistWhat"] or (
-                not strippedContent and msg.channel.type != discord.ChannelType.public_thread)):
+        elif len(msg.attachments) == 0 and len(msg.embeds) == 0 and msg.reference is None and (
+                strippedContent in config["wordlistWhat"] or not strippedContent):
             try:
                 # Convert recent channel history into list of messages
                 history = [oldMsg async for oldMsg in msg.channel.history(limit=2)]
@@ -281,7 +280,7 @@ async def on_message(msg: discord.Message) -> None:
             await msg.delete(delay=8)
 
     # No special handling, just do sentiment analysis and modify user's social credit
-    else:
+    elif len(contentL) > 25:
         # Invert if discussing treasonous things (saying bad things about bad things is now good)
         # Use fuzzy matching on treason wordlist, apparently it only takes 4ms for >2000-char msg
         # to be checked against a list of 10 treasonous words on gamer rig
@@ -290,7 +289,7 @@ async def on_message(msg: discord.Message) -> None:
             for msgWord in splitL for word in config["wordlistTreason"]]
         treasonCount = fuzzlist.count(True)
         if treasonCount > 0:
-            creditMult += treasonCount//5 # if they're really going ham on the matches, increase mult
+            creditMult += treasonCount//4 # if they're really going ham on the matches, increase mult
             creditMult *= -1
 
         # Get base message sentiment and credit value, and modify user's credit
@@ -306,7 +305,7 @@ async def on_message(msg: discord.Message) -> None:
             await writeCreditToDisk()
 
 
-def sentimentAnalysis(content: str) -> float: #TODO testing
+def sentimentAnalysis(content: str) -> float:
     """Analyzes sentiment of {content}, which is a float between 0 (negative) and 1 (positive).
     The ^vibe command outputs this value, and convertSentiment (into credit) uses this as input."""
     tokenizedInput = numpy.array([tokenizer.encode(content)], dtype=numpy.int32)
@@ -385,7 +384,7 @@ async def findVoteTarget(msg: discord.Message) -> discord.Message | None: #TODO 
             if (len(splitL) > 1 and splitL[1] == "bot") or (
                     len(splitL) == 2 and splitL[0] in ["good", "bad", "medium"]) or (
                     trgtMsg.author.bot and
-                    re.search(r"^(?:thank )?you (?:for|can) (?:voting|only) (?:on|vote) ", contentL)):#TODO test
+                    re.search(r"^(?:thank )?you (?:for|can) (?:voting|only) (?:on|vote) ", contentL)):
 
                 # If the voter is trgtMsg's author, voter already voted on the message
                 if trgtMsg.author.id == msg.author.id:
