@@ -1,6 +1,7 @@
 import asyncio
 import datetime
 import discord
+import discord.ext.tasks
 import json
 import numpy
 import os
@@ -96,15 +97,39 @@ dataLock = asyncio.Lock()
 # Also the ping role, which indicates which users are okay with being pinged
 pingRole = {}
 
+# Schedule daily decay
+@discord.ext.tasks.loop(time=datetime.time(hour=8, minute=0, second=0)) # UTC time
+async def credit_decay():
+    async with dataLock:
+        global userData
+        for GUILD in client.guilds:
+            for MEMBER in GUILD.members:
+                USERID = str(MEMBER.id)
+                if USERID in userData.keys():
+                    userData[USERID]["preDecay"] = userData[USERID]["credit"]
+                    if -100 <= userData[USERID]["credit"] <= 100: # min -1, max -5/day
+                        userData[USERID]["credit"] = int(userData[USERID]["credit"] * 0.95)
+                    elif -3000 <= userData[USERID]["credit"] <= 3000: # min -1, max -15/day
+                        userData[USERID]["credit"] = int(userData[USERID]["credit"] * 0.995)
+                    else: # min -4, no max but you need 15000 credit to reach -15/day
+                        userData[USERID]["credit"] = int(userData[USERID]["credit"] * 0.999)
+
+
+# Client event overrides
 @client.event
 async def on_ready() -> None:
     """Load user credit from disk, fetch the ping role to identify which users want to be pinged,
-    and output the configured word lists."""
+    start the daily decay task, and output the configured word lists."""
     await readCreditFromDisk()
+
     global pingRole
-    for guild in client.guilds:
-        pingRole[guild] = discord.utils.get(guild.roles, name=config["pingRole"])
+    for GUILD in client.guilds:
+        pingRole[GUILD] = discord.utils.get(GUILD.roles, name=config["pingRole"])
     print(f"Found the following ping roles for the following servers:\n{pingRole}\n")
+
+    if not credit_decay.is_running():
+        credit_decay.start()
+
     print(
         f"Messages with these words invert sentiment analysis:\n{config['wordlistTreason']}\n\n"
         f"These messages will trigger the bot's time function:\n{config['wordlistTime']}\n\n"
@@ -136,14 +161,9 @@ async def on_message(msg: discord.Message) -> None:
     splitL = contentL.split()
     now = msg.created_at.astimezone() # convert to local tz
 
-    # Set multiplier for how much user social credit is modified by, depending on the channel
+    # Set base 1x multiplier for how much user social credit is modified by
     # An active "good"/"bad" bot counts as 15 credit, before mults
-    if msg.channel.name == "shitposts": # everyone likes memes
-        creditMult = 2
-    elif msg.channel.name == "politics": # spicy
-        creditMult = 3
-    else: # default 1x multiplier for most channels
-        creditMult = 1
+    creditMult = 1
 
     # Check invoker commands
     if msg.content.startswith(config["invoker"]):
