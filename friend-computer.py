@@ -32,7 +32,7 @@ except FileNotFoundError:
             "nameH5Model": "model.h5",
             "nameTfliteModel": "model.tflite",
             "nameTokenizer": "tokenizer.pickle",
-            "pingRole": "pingMe",
+            "quietRole": "Don'tPingMe",
             "wordlistTime": ["now", "time", "what time", "when"],
             "wordlistWhat": ["what", "wat", "wut", "huh", "nani"],
             "wordlistTreason": [
@@ -94,8 +94,8 @@ client = discord.Client(
 # Create userData dict to keep track of user credit and treason stars, and corresponding mutex
 userData = {}
 dataLock = asyncio.Lock()
-# Also the ping role, which indicates which users are okay with being pinged
-pingRole = {}
+# Also the quiet role, which indicates which users don't want to get @-mentioned
+quietRole = {}
 
 # Schedule daily decay
 @discord.ext.tasks.loop(time=datetime.time(hour=8, minute=0, second=0)) # UTC time
@@ -122,10 +122,10 @@ async def on_ready() -> None:
     start the daily decay task, and output the configured word lists."""
     await readCreditFromDisk()
 
-    global pingRole
+    global quietRole
     for GUILD in client.guilds:
-        pingRole[GUILD] = discord.utils.get(GUILD.roles, name=config["pingRole"])
-    print(f"Found the following ping roles for the following servers:\n{pingRole}\n")
+        quietRole[GUILD] = discord.utils.get(GUILD.roles, name=config["quietRole"])
+    print(f"Found the following don't-ping roles for the following servers:\n{quietRole}\n")
 
     if not credit_decay.is_running():
         credit_decay.start()
@@ -202,21 +202,19 @@ async def on_message(msg: discord.Message) -> None:
             sentiment = sentimentAnalysis(trgt.content)
             await msg.reply(f"The prior message's sentiment is: {sentiment}", mention_author=False)
 
-    # Penalize users who ping author when replying to messages sent within the last hour
-    # Unless the target author is a bot or has the pingRole to indicate they're fine with it
-    # Also give initial 5-minute grace period as well since the target's probably still active
-    #TODO if msg.type == discord.MessageType.reply and len(msg.mentions) == 1:
-    #     refMsg = await msg.channel.fetch_message(msg.reference.message_id)
-    #     refMsgTime = refMsg.created_at.astimezone()
-    #     elapsed = (now - refMsgTime).seconds
-    #     if not refMsg.author.bot and refMsg.author == msg.mentions[0] and (
-    #             pingRole[msg.guild] not in refMsg.author.roles) and 300 <= elapsed <= 3600:
-    #         await msg.reply(
-    #             "FYI, this user doesn't want to be pinged when they're replied to! "
-    #             "https://tenor.com/view/dont-reply-ping-reply-ping-reply-discord-reply-discord-gif-22725442",
-    #             mention_author=True)
-    #         # silently penalize credit, so people maxxing negative credit don't spam this
-    #         await updateCredit(msg.author.id, credit=-10, treason=1)
+    # Penalize users who ping authors with the quietRole, when replying to their messages < 1hr old
+    # Also give initial 6-minute grace period since the target's likely still active anyway
+    if msg.type == discord.MessageType.reply and len(msg.mentions) == 1:
+        refMsg = await msg.channel.fetch_message(msg.reference.message_id)
+        refMsgTime = refMsg.created_at.astimezone()
+        elapsed = (now - refMsgTime).seconds
+        if refMsg.author == msg.mentions[0] and 360 <= elapsed <= 3600 and (
+                quietRole[msg.guild] in refMsg.author.roles):
+            await msg.reply(
+                "FYI, this user doesn't want to be pinged when you Reply to their messages! "
+                "https://tenor.com/view/discord-gif-9382638485807678151", mention_author=True)
+            # one automatic but silent bad bot, so people maxxing negative credit don't spam this
+            await updateCredit(msg.author.id, credit=-15, treason=1)
 
     # De-obscure links first, forgoing all other features (we want to discourage hiding links)
     linkSearch = re.search(r"\[(.+)\]\((\w+://)((?:[a-z0-9-]+\.)+\w+)(.*)\)", contentL)
@@ -241,13 +239,13 @@ async def on_message(msg: discord.Message) -> None:
         if target is not None:
             name = getAuthorMember(target).nick
             await updateCredit(target.author.id, credit=credit, name=name)
-            #TODO if pingRole[msg.guild] in target.author.roles:
+            # if quietRole[msg.guild] in target.author.roles:
             #     await target.channel.send(
-            #         f"Thank you for voting on {target.author.mention}! "
+            #         f"Thank you for voting on {name}! "
             #         f"They now have {userData[target.author.id]["credit"]} social credit.")
             # else:
             #     await target.channel.send(
-            #         f"Thank you for voting on {name}! "
+            #         f"Thank you for voting on {target.author.mention}! "
             #         f"They now have {userData[target.author.id]["credit"]} social credit.")
 
     # Scan for short message triggers, if present handle those and return without further processing
