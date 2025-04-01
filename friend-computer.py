@@ -11,6 +11,7 @@ from rapidfuzz import fuzz
 import random
 import re
 import sys
+from systemd import journal
 # import tensorflow
 from tensorflow import keras
 import tensorflow_datasets # needed by tokenizer.pickle, even though it looks unused
@@ -125,12 +126,12 @@ async def on_ready() -> None:
     global quietRole
     for GUILD in client.guilds:
         quietRole[GUILD] = discord.utils.get(GUILD.roles, name=config["quietRole"])
-    print(f"Found the following don't-ping roles for the following servers:\n{quietRole}\n")
+    journal.write(f"Found the following don't-ping roles for the following servers:\n{quietRole}\n")
 
     if not credit_decay.is_running():
         credit_decay.start()
 
-    print(
+    journal.write(
         f"Messages with these words invert sentiment analysis:\n{config['wordlistTreason']}\n\n"
         f"These messages will trigger the bot's time function:\n{config['wordlistTime']}\n\n"
         f"And these messages will trigger the bot's shouting function:\n{config['wordlistWhat']}")
@@ -458,7 +459,9 @@ async def readCreditFromDisk() -> None:
         filePath.touch()
 
     except json.decoder.JSONDecodeError:
-        print("Couldn't load user stats from file, this is expected if the file is empty.")
+        journal.write(
+            "Couldn't load user stats from file, this is expected if the file is empty.",
+            priority=journal.Priority.WARNING)
         with open(filePath) as file:
             if len(file.read()) > 20: # there's at least one user entry
                 sys.exit(
@@ -517,10 +520,10 @@ async def writeCreditToDisk() -> None:
                 json.dump(userData, file, indent=4)
 
     except Exception as e:
-        print(
+        journal.write(
             f"Either couldn't take backup, or couldn't write user credit to disk, due to: {e}\n\n"
             "If the backup failed, the main file also wasn't written, to preserve current contents."
-            f"\n\nDumping current user data:{userData}")
+            f"\n\nDumping current user data:{userData}", priority=journal.Priority.ERROR)
 
 
 if __name__ == "__main__":
