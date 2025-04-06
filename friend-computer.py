@@ -5,6 +5,7 @@ import discord.ext.tasks
 import json
 import numpy
 import os
+import pandas
 from pathlib import Path
 import pickle
 from rapidfuzz import fuzz
@@ -101,19 +102,46 @@ quietRole = {}
 # Schedule daily decay
 @discord.ext.tasks.loop(time=datetime.time(hour=8, minute=0, second=0)) # UTC time
 async def credit_decay():
+    try:
+        # Fetch Volatility Index (VIX) dataset, skipping most history, getting only CoB values
+        vixHistory = None
+        vixHistory = pandas.read_csv(
+            "https://cdn.cboe.com/api/global/us_indices/daily_prices/VIX_History.csv",
+            usecols=[4], skiprows=8900)
+        # Use yesterday's CoB VIX value to apply a modifier to all users' credit.
+        # Long term average is around 19.5, so subtract that, then divide by 30 since VIX is
+        # forecasted for 30 days but decay triggers daily. Finally, divide by 100 and add 1 to
+        # make this a percent modifier of all credit. We're subtracting the average from the VIX
+        # so that when market instability goes up, so does user credit, as a consolation prize.
+        vixModifier = ((vixHistory.tail(1) - 19.5)/30) / 100 + 1
+    except:
+        vixModifier = 1 # if above fails, set this multiplier to 1
+    finally:
+        del vixHistory
+
+    journal.write(f"Starting credit decay, using VIX modifier of {vixModifier}")
     async with dataLock:
         global userData
+        # For each user in each guild, apply a base decay percentage (based on credit milestone),
+        # multiplied by the VIX modifier, then add any dividends from stonks the user holds.
         for GUILD in client.guilds:
             for MEMBER in GUILD.members:
                 USERID = str(MEMBER.id)
-                if USERID in userData.keys():
-                    userData[USERID]["preDecay"] = userData[USERID]["credit"]
-                    if -100 <= userData[USERID]["credit"] <= 100: # min -1, max -5/day
-                        userData[USERID]["credit"] = int(userData[USERID]["credit"] * 0.95)
-                    elif -3000 <= userData[USERID]["credit"] <= 3000: # min -1, max -15/day
-                        userData[USERID]["credit"] = int(userData[USERID]["credit"] * 0.995)
-                    else: # min -4, no max but you need 15000 credit to reach -15/day
-                        userData[USERID]["credit"] = int(userData[USERID]["credit"] * 0.999)
+                if USERID in userData:
+                    userData[USERID]["preDecay"] = userData[USERID]["credit"] # debug info
+                    stonks = userData[USERID]["stonks"]
+
+                    if -100 <= userData[USERID]["credit"] <= 100: # min -1, max -5/day, before VIX/stonks
+                        userData[USERID]["credit"] = int(
+                            userData[USERID]["credit"] * 0.95 * vixModifier + stonks)
+
+                    elif -1000 <= userData[USERID]["credit"] <= 1000: # min -1, max -5/day, before VIX/stonks
+                        userData[USERID]["credit"] = int(
+                            userData[USERID]["credit"] * 0.995 * vixModifier + stonks)
+
+                    else: # min -2, no max but you need 10000 credit to reach -10/day, etc., before VIX/stonks
+                        userData[USERID]["credit"] = int(
+                            userData[USERID]["credit"] * 0.999 * vixModifier + stonks)
 
 
 # Client event overrides
@@ -132,7 +160,7 @@ async def on_ready() -> None:
         credit_decay.start()
 
     journal.write(
-        f"Messages with these words invert sentiment analysis:\n{config['wordlistTreason']}\n\n"
+        f"Messages with these words invert credit from sentiment analysis:\n{config['wordlistTreason']}\n\n"
         f"These messages will trigger the bot's time function:\n{config['wordlistTime']}\n\n"
         f"And these messages will trigger the bot's shouting function:\n{config['wordlistWhat']}")
 
@@ -169,6 +197,7 @@ async def on_message(msg: discord.Message) -> None:
     # Check invoker commands
     if msg.content.startswith(config["invoker"]):
         command = msg.content[1:]
+        journal.write(f"{command} command issued in {msg.channel.name}")
         if getAuthorMember(msg).guild_permissions.administrator:
             if command.startswith("purge"):
                 try:
@@ -181,7 +210,11 @@ async def on_message(msg: discord.Message) -> None:
                     if deleted > 0 and deleted % 5 == 0:
                         await asyncio.sleep(3.1)
                     await purgeList[deleted].delete()
-                return
+                journal.write(f"Purged {amount} messages in {msg.channel.name}")
+
+            elif command == "write":
+                await writeCreditToDisk()
+
 
             elif command == "shut":
                 await writeCreditToDisk()
@@ -195,7 +228,23 @@ async def on_message(msg: discord.Message) -> None:
                 await client.close()
                 os.system("sudo systemctl restart friend-computer.service")
 
-        if command.startswith("vibe"):
+        if command == "help":
+            await msg.reply(
+                "Vote on messages by sending any 2 word message where the first word is one of "
+                "[good / bad / medium], or sending a 2+ word message where the second word is 'bot'. "
+                "You can also Reply to a message to vote on it, and subsequent votes will continue to vote on the "
+                "referenced message. This only works once and only on recent messages, to avoid abuse."
+                "\nCredit slightly decays daily, and is also tied to the Cboe Volatility Index - "
+                "higher stock market volatility means higher credit, so when your real investments "
+                "are eating shit, at least your fake one will be growing!\n\n"
+                "Commands:\n**vibeCheck**: Analyse the previous message's sentiment. If used in a Reply, "
+                "analyse the referenced message instead.\n"
+                "**stonk**: Buy a stonk. Costs 5000 credit, but pays 1 credit in daily dividends. "
+                "Safety-Steve had purchase-confirmation, but I'm too lazy, so use at your own risk."
+                "\n*(Admin-only, but so they don't have to memorize)*: purge X, restart, shut, write.",
+                mention_author=False)
+
+        elif command.startswith("vibe"):
             if msg.reference is not None:
                 trgt = await findVoteTarget(msg) # allow reply-vibing messages
             else:
@@ -203,19 +252,34 @@ async def on_message(msg: discord.Message) -> None:
             sentiment = sentimentAnalysis(trgt.content)
             await msg.reply(f"The prior message's sentiment is: {sentiment}", mention_author=False)
 
-    # Penalize users who ping authors with the quietRole, when replying to their messages < 1hr old
-    # Also give initial 6-minute grace period since the target's likely still active anyway
+        elif command.startswith("stonk"):
+            USERID = str(msg.author.id)
+            if USERID in userData and userData[USERID]["credit"] >= 5000:
+                await updateCredit(msg.author.id, credit=-5000, stonks=1)
+                await msg.reply(
+                    "Bought one stonk for 5000 credit! You now have "
+                    f"{userData[USERID]['stonks']} stonks.", mention_author=False)
+            else:
+                await msg.reply("You need 5000 credit to buy a stonk!", mention_author=False)
+
+        return
+
+    # Penalize users who Reply-ping authors with the quietRole, if reference msg is < 2 hours old
+    # Also give initial 20-minute grace period, since target's likely still active or won't mind
     if msg.type == discord.MessageType.reply and len(msg.mentions) == 1:
         refMsg = await msg.channel.fetch_message(msg.reference.message_id)
         refMsgTime = refMsg.created_at.astimezone()
         elapsed = (now - refMsgTime).seconds
-        if refMsg.author == msg.mentions[0] and 360 <= elapsed <= 3600 and (
+        if refMsg.author == msg.mentions[0] and 1200 <= elapsed <= 7200 and (
                 quietRole[msg.guild] in refMsg.author.roles):
-            await msg.reply(
-                "FYI, this user doesn't want to be pinged when you Reply to their messages! "
-                "https://tenor.com/view/discord-gif-9382638485807678151", mention_author=True)
-            # one auto silent bad bot, so people maxxing negative credit don't spam this
-            await updateCredit(msg.author.id, credit=-15, treason=1)
+            if random.random() >= 0.5: # only 50/50 chance to output the warning, since so many users aren't respecting this rn lmao
+                await msg.reply(
+                    "FYI, this user doesn't want to get pinged by Replies!\nYou can hold Shift "
+                    "when clicking Reply to disable the ping", mention_author=True)
+            # transfer some credit from the offender to the victim, in compensation
+            # silently, so people maxxing negative credit don't spam this
+            await updateCredit(msg.author.id, credit=-10, treason=1)
+            await updateCredit(refMsg.author.id, credit=10)
 
     # De-obscure links first, forgoing all other features (we want to discourage hiding links)
     linkSearch = re.search(r"\[(.+)\]\((\w+://)((?:[a-z0-9-]+\.)+\w+)(.*)\)", contentL)
@@ -228,7 +292,7 @@ async def on_message(msg: discord.Message) -> None:
 
     # Check good/bad/"any" bots - can have any leading/trailing words as long as 2nd one is "bot"
     # Or can start with "good"/"bad"/"medium" and have precisely one trailing word
-    elif (len(splitL) > 1 and splitL[1] == "bot") or (
+    elif (len(splitL) > 1 and splitL[1] == "bot" and splitL[0] not in ["a", "the", "this"]) or (
             len(splitL) == 2 and splitL[0] in ["good", "bad", "medium"]):
         # Let sentiment analysis decide whether vote is positive or negative
         sentiment = sentimentAnalysis(msg.content)
@@ -253,7 +317,7 @@ async def on_message(msg: discord.Message) -> None:
     # Also results in messages needing to be a minimum length of 25 chars for sentiment analysis.
     # Exclude messages of 0 length since Discord considers some system/thread messages as 0-length
     elif 1 <= len(contentL) <= 25:
-        strippedContent = contentL.strip("^?!")
+        strippedContent = contentL.strip("?!")
         if strippedContent in config["wordlistTime"]:
             if now.strftime("%a") == "Wed":
                 await msg.channel.send("It is Wednesday, my dudes")
@@ -381,10 +445,9 @@ async def findVoteTarget(msg: discord.Message) -> discord.Message | None: #TODO 
             # Check if this trgtMsg is a vote or the bot's response to a vote
             contentL = trgtMsg.content.lower()
             splitL = contentL.split()
-            if (len(splitL) > 1 and splitL[1] == "bot") or (
+            if (len(splitL) > 1 and splitL[1] == "bot" and splitL[0] not in ["a", "the", "this"]) or (
                     len(splitL) == 2 and splitL[0] in ["good", "bad", "medium"]) or (
-                    trgtMsg.author.bot and
-                    re.search(r"^(?:thank )?you (?:for|can) (?:voting|only) (?:on|vote) ", contentL)):
+                    trgtMsg.author.bot and re.search(r"^(?:thank )?you (?:for|can) (?:voting|only) (?:on|vote) ", contentL)):
 
                 # If the voter is trgtMsg's author, voter already voted on the message
                 if trgtMsg.author.id == msg.author.id:
@@ -426,33 +489,37 @@ def getAuthorMember(msg: discord.Message) -> discord.Member:
 
 
 async def updateCredit(
-    userID: int, credit: int=0, treason: int=0, name: str=None, date: str=None) -> None:
-    """Update user social credit in async-safe way. {credit} should be a positive or negative
-    integer - the amount by which to modify the user's social credit. Likewise for {treason}.
-    {name} and {date} are purely informational fields, which get populated over time, to help
-    users read the stats file and make sense of it at a glance."""
-    userID = str(userID) # Convert to string, because the keys in the stats file are all strings
+    userID: int, credit: int=0, treason: int=0, stonks: int=0, name: str=None, date: str=None) -> None:
+    """Update user social credit in async-safe way. credit should be a positive or negative integer,
+    the amount by which to modify the user's social credit. Likewise for treason and stonks.
+    name and date are purely informational fields, which get populated over time, to help users read
+    the stats file and make sense of it at a glance."""
+    USERID = str(userID) # Convert to string, because the keys in the stats file are all strings
     async with dataLock:
         global userData
-        if userID not in userData.keys():
-            userData[userID] = {"credit": 0, "treason": 0}
-        userData[userID]["credit"] += credit
-        userData[userID]["treason"] += treason
+        if USERID not in userData:
+            userData[USERID] = {"credit": 0, "treason": 0, "stonks": 0, "name": "", "lastUpdate": ""}
+        userData[USERID]["credit"] += credit
+        userData[USERID]["treason"] += treason
+        userData[USERID]["stonks"] += stonks
         if name is not None:
-            userData[userID]["name"] = name
+            userData[USERID]["name"] = name
         if date is not None:
-            userData[userID]["lastUpdate"] = date
+            userData[USERID]["lastUpdate"] = date
 
 
 async def readCreditFromDisk() -> None:
     """Retrieve all user social credit values from on-disk data file. Should only be needed on
     bot startup."""
+    journal.write("Reading user stats from disk...")
     filePath = Path(f"{sys.path[0]}/data/user-stats.json")
     try:
         async with dataLock:
             with open(filePath) as file:
                 global userData
                 userData = json.load(file)
+                journal.write("User stats loaded from disk")
+
 
     except FileNotFoundError:
         filePath.touch()
@@ -472,6 +539,7 @@ async def writeCreditToDisk() -> None:
     """Write current social credit values for all users to the on-disk data file. Since almost every
     message will cause a social credit update, this method shouldn't be called by every on_message.
     Scheduling is cool, but it's more fun to give on_message a low chance to call this method."""
+    journal.write("Writing user stats to disk...")
     filePath = Path(f"{sys.path[0]}/data/user-stats.json")
     try:
         async with dataLock:
@@ -495,17 +563,8 @@ async def writeCreditToDisk() -> None:
                         prevBackup[f"{num + 1}"]["timestamp"] = now
                         prevBackup[f"{num + 1}"]["userdata"] = userData
                     else:
-                        # Look for signs of abuse - ridiculous credit gain/loss since last backup
-                        # Invert user's credit if >2000 difference and give 10 treason
-                        for user in prevBackup["3"]["userdata"]:
-                            if (
-                                    userData[user]["credit"] > prevBackup["3"]["userdata"][user]["credit"] + 2000 or
-                                    userData[user]["credit"] < prevBackup["3"]["userdata"][user]["credit"] - 2000):
-                                userData[user]["credit"] *= -1
-                                userData[user]["treason"] += 10
-
-                        # Take the backup - first two operations just reassign pointers,
-                        # so need to initialize ["3"] to a new dict to not update ["2"]'s values
+                        # Take the backup - first two operations just reassign pointers, so need to
+                        # initialize ["3"] to a new dict to not end up updating ["2"]'s values too
                         prevBackup["1"] = prevBackup["2"]
                         prevBackup["2"] = prevBackup["3"]
                         prevBackup["3"] = {}
@@ -513,10 +572,12 @@ async def writeCreditToDisk() -> None:
                         prevBackup["3"]["userdata"] = userData
 
                     json.dump(prevBackup, backup, indent=4)
+                    journal.write("Backup written to disk")
 
             # Write user data to disk
             with open(filePath, "w") as file:
                 json.dump(userData, file, indent=4)
+                journal.write("User stats written to disk")
 
     except Exception as e:
         journal.write(
