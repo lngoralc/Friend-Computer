@@ -30,6 +30,7 @@ except FileNotFoundError:
         json.dump({
             "name": "Friend-Computer",
             "description": "Manages an ironic social credit system",
+            "announceChannelName": "general",
             "invoker": "^",
             "nameH5Model": "model.h5",
             "nameTfliteModel": "model.tflite",
@@ -98,50 +99,77 @@ userData = {}
 dataLock = asyncio.Lock()
 # Also the quiet role, which indicates which users don't want to get @-mentioned
 quietRole = {}
+# Channel to send bot announcements to
+announceChannel = {}
 
-# Schedule daily decay
-@discord.ext.tasks.loop(time=datetime.time(hour=8, minute=0, second=0)) # UTC time
-async def credit_decay():
+
+async def getVIXModifer():
     try:
-        # Fetch Volatility Index (VIX) dataset, skipping most history, getting only CoB values
+        # Fetch Volatility Index (VIX) dataset, skipping most history, getting date and CoB value
         vixHistory = None
         vixHistory = pandas.read_csv(
             "https://cdn.cboe.com/api/global/us_indices/daily_prices/VIX_History.csv",
-            usecols=[4], skiprows=8900)
+            usecols=[0, 4], skiprows=8900, names=["DATE", "CLOSE"], index_col=0).tail(10)
+        journal.write(f"Downloaded VIX history, only saved last two weeks:\n{vixHistory}")
         # Use yesterday's CoB VIX value to apply a modifier to all users' credit.
         # Long term average is around 19.5, so subtract that, then divide by 30 since VIX is
         # forecasted for 30 days but decay triggers daily. Finally, divide by 100 and add 1 to
         # make this a percent modifier of all credit. We're subtracting the average from the VIX
         # so that when market instability goes up, so does user credit, as a consolation prize.
-        vixModifier = ((vixHistory.tail(1) - 19.5)/30) / 100 + 1
+        return ((vixHistory.iloc[-1][0] - 19.5)/30) / 100 + 1
     except:
-        vixModifier = 1 # if above fails, set this multiplier to 1
-    finally:
-        del vixHistory
+        return 1 # if above fails, set this multiplier to 1
 
-    journal.write(f"Starting credit decay, using VIX modifier of {vixModifier}")
+
+# Schedule daily decay
+@discord.ext.tasks.loop(time=datetime.time(hour=8, minute=0, second=0)) # UTC time
+async def creditDecay():
+    dayOfWeek = datetime.datetime.now().strftime("%a")
+    vixMod = await getVIXModifer()
+    journal.write(f"Starting credit decay, using VIX modifier of {vixMod}")
     async with dataLock:
         global userData
         # For each user in each guild, apply a base decay percentage (based on credit milestone),
         # multiplied by the VIX modifier, then add any dividends from stonks the user holds.
-        for GUILD in client.guilds:
-            for MEMBER in GUILD.members:
-                USERID = str(MEMBER.id)
-                if USERID in userData:
-                    userData[USERID]["preDecay"] = userData[USERID]["credit"] # debug info
-                    stonks = userData[USERID]["stonks"]
+        for guild in client.guilds:
+            GID = str(guild.id)
+            if dayOfWeek == "Sun":
+                creditEmbed = discord.Embed(title="User Statistics")
 
-                    if -100 <= userData[USERID]["credit"] <= 100: # min -1, max -5/day, before VIX/stonks
-                        userData[USERID]["credit"] = int(
-                            userData[USERID]["credit"] * 0.95 * vixModifier + stonks)
+            for member in guild.members:
+                UID = str(member.id)
+                if UID in userData[GID]:
+                    userData[GID][UID]["preDecay"] = userData[GID][UID]["credit"] # debug info
+                    stonks = userData[GID][UID]["stonks"]
 
-                    elif -1000 <= userData[USERID]["credit"] <= 1000: # min -1, max -5/day, before VIX/stonks
-                        userData[USERID]["credit"] = int(
-                            userData[USERID]["credit"] * 0.995 * vixModifier + stonks)
+                    if -100 <= userData[GID][UID]["credit"] <= 100: # min -1, max -5/day, before VIX/stonks
+                        userData[GID][UID]["credit"] = int(
+                            userData[GID][UID]["credit"] * 0.95 * vixMod + stonks)
+
+                    elif -1000 <= userData[GID][UID]["credit"] <= 1000: # min -1, max -5/day, before VIX/stonks
+                        userData[GID][UID]["credit"] = int(
+                            userData[GID][UID]["credit"] * 0.995 * vixMod + stonks)
 
                     else: # min -2, no max but you need 10000 credit to reach -10/day, etc., before VIX/stonks
-                        userData[USERID]["credit"] = int(
-                            userData[USERID]["credit"] * 0.999 * vixModifier + stonks)
+                        userData[GID][UID]["credit"] = int(
+                            userData[GID][UID]["credit"] * 0.999 * vixMod + stonks)
+
+                    userData[GID][UID]["name"] = member.nick if member.nick is not None else member.name
+
+                    if dayOfWeek == "Sun":                        # equivalent of one mega bad bot
+                        netWorth = userData[GID][UID]["credit"] - 45*userData[GID][UID]["treason"] + int(
+                            userData[GID][UID]["stonks"] * 5000 // (((vixMod - 1) * 30) + 1))
+                        creditEmbed.add_field(
+                            name=userData[GID][UID]["name"],
+                            value=f"**Credit**: {userData[GID][UID]['credit']}\n"
+                            f"**Stonks**: {userData[GID][UID]['stonks']}\n"
+                            f"**Net Worth**: {netWorth}\n"
+                            f"**Treason**: {userData[GID][UID]['treason']}")
+
+            if dayOfWeek == "Sun":
+                await announceChannel[GID].send(
+                    "The weekly user summary is now ready. Please verify your status, citizens!",
+                    embed=creditEmbed)
 
 
 # Client event overrides
@@ -152,12 +180,19 @@ async def on_ready() -> None:
     await readCreditFromDisk()
 
     global quietRole
-    for GUILD in client.guilds:
-        quietRole[GUILD] = discord.utils.get(GUILD.roles, name=config["quietRole"])
+    global announceChannel
+    for guild in client.guilds:
+        quietRole[str(guild.id)] = discord.utils.get(guild.roles, name=config["quietRole"])
+        announceChannel[str(guild.id)] = discord.utils.get(guild.channels, name=config["announceChannelName"])
     journal.write(f"Found the following don't-ping roles for the following servers:\n{quietRole}\n")
+    journal.write(f"Found these announce channels in the following servers:\n{announceChannel}\n")
 
-    if not credit_decay.is_running():
-        credit_decay.start()
+    if not creditDecay.is_running():
+        creditDecay.start()
+
+    activity = discord.Activity(type=discord.ActivityType.watching, name="you")
+    await client.change_presence(activity=activity)
+    journal.write("Set Discord activity")
 
     journal.write(
         f"Messages with these words invert credit from sentiment analysis:\n{config['wordlistTreason']}\n\n"
@@ -189,6 +224,8 @@ async def on_message(msg: discord.Message) -> None:
     contentL = msg.content.lower()
     splitL = contentL.split()
     now = msg.created_at.astimezone() # convert to local tz
+    GID = str(msg.guild.id)
+    UID = str(msg.author.id)
 
     # Set base 1x multiplier for how much user social credit is modified by
     # An active "good"/"bad" bot counts as 15 credit, before mults
@@ -197,7 +234,7 @@ async def on_message(msg: discord.Message) -> None:
     # Check invoker commands
     if msg.content.startswith(config["invoker"]):
         command = msg.content[1:]
-        journal.write(f"{command} command issued in {msg.channel.name}")
+        journal.write(f"{command} command issued in channel '{msg.channel.name}'")
         if getAuthorMember(msg).guild_permissions.administrator:
             if command.startswith("purge"):
                 try:
@@ -212,15 +249,6 @@ async def on_message(msg: discord.Message) -> None:
                     await purgeList[deleted].delete()
                 journal.write(f"Purged {amount} messages in {msg.channel.name}")
 
-            elif command == "write":
-                await writeCreditToDisk()
-
-
-            elif command == "shut":
-                await writeCreditToDisk()
-                await client.close()
-                sys.exit(0)
-
             # Other stuff is hosted on same system, so don't want to allow reboot.
             # Systemctl restart for the bot's service should do the trick
             elif command == "restart":
@@ -228,10 +256,18 @@ async def on_message(msg: discord.Message) -> None:
                 await client.close()
                 os.system("sudo systemctl restart friend-computer.service")
 
+            elif command == "stop":
+                await writeCreditToDisk()
+                await client.close()
+                sys.exit(0)
+
+            elif command == "write":
+                await writeCreditToDisk()
+
         if command == "help":
             await msg.reply(
                 "Vote on messages by sending any 2 word message where the first word is one of "
-                "[good / bad / medium], or sending a 2+ word message where the second word is 'bot'. "
+                "[good/bad/medium], or sending a 2+ word message where the second word is 'bot'. "
                 "You can also Reply to a message to vote on it, and subsequent votes will continue to vote on the "
                 "referenced message. This only works once and only on recent messages, to avoid abuse."
                 "\nCredit slightly decays daily, and is also tied to the Cboe Volatility Index - "
@@ -239,28 +275,54 @@ async def on_message(msg: discord.Message) -> None:
                 "are eating shit, at least your fake one will be growing!\n\n"
                 "Commands:\n**vibeCheck**: Analyse the previous message's sentiment. If used in a Reply, "
                 "analyse the referenced message instead.\n"
-                "**stonk**: Buy a stonk. Costs 5000 credit, but pays 1 credit in daily dividends. "
-                "Safety-Steve had purchase-confirmation, but I'm too lazy, so use at your own risk."
-                "\n*(Admin-only, but so they don't have to memorize)*: purge X, restart, shut, write.",
+                "**stonks**: Lists your stonks and their value. Base value is 5000 credit, but is "
+                "affected by stock market trends. Each stonk pays 1 credit in daily dividends.\n"
+                "Use **stonk buy** or **stonk sell** to buy or sell a stonk.\n"
+                "*(Admin-only, but so they don't have to memorize)*: purge X, restart, stop, write.",
                 mention_author=False)
+
+        elif command.startswith("stonk"):
+            # Divide by vixModifier instead of multiplying, because vixModifier is above 1.0 when
+            # stock prices are falling. Also multiply vixModifier by 30 because it's reduced by that
+            # amount for daily decay, but we don't need that reduction for stonk transactions
+            vixMod = ((await getVIXModifer() - 1) * 30) + 1
+            stonkValue = int(5000//vixMod)
+
+            commandSplit = command.split()
+            if len(commandSplit) > 1 and commandSplit[1] == "buy":
+                if UID in userData[GID] and userData[GID][UID]["credit"] >= stonkValue:
+                    await updateCredit(GID, UID, credit=-stonkValue, stonks=1)
+                    await msg.reply(
+                        f"Bought one stonk for {stonkValue} credit! You now have "
+                        f"{userData[GID][UID]['stonks']} stonks.", mention_author=False)
+                else:
+                    await msg.reply(
+                        f"You need {stonkValue} credit to buy a stonk today!", mention_author=False)
+
+            elif len(commandSplit) > 1 and commandSplit[1] == "sell":
+                if UID in userData[GID] and userData[GID][UID]["stonks"] > 0:
+                    await updateCredit(GID, UID, credit=stonkValue, stonks=-1)
+                    await msg.reply(
+                        f"Sold one stonk for {stonkValue} credit! You now have "
+                        f"{userData[GID][UID]['stonks']} stonks.", mention_author=False)
+                else:
+                    await msg.reply("You need stonks to sell a stonk!", mention_author=False)
+
+            else:
+                if UID in userData[GID]:
+                    await msg.reply(
+                        f"You currently have {userData[GID][UID]['stonks']} stonks, which are "
+                        f"currently valued at {stonkValue} credit each.", mention_author=False)
+                else:
+                    await msg.reply("You have no stonks!", mention_author=False)
 
         elif command.startswith("vibe"):
             if msg.reference is not None:
-                trgt = await findVoteTarget(msg) # allow reply-vibing messages
+                trgt = await findVoteTarget(msg) # allow Reply-vibing messages
             else:
                 trgt = [_ async for _ in msg.channel.history(limit=2)][-1]
             sentiment = sentimentAnalysis(trgt.content)
             await msg.reply(f"The prior message's sentiment is: {sentiment}", mention_author=False)
-
-        elif command.startswith("stonk"):
-            USERID = str(msg.author.id)
-            if USERID in userData and userData[USERID]["credit"] >= 5000:
-                await updateCredit(msg.author.id, credit=-5000, stonks=1)
-                await msg.reply(
-                    "Bought one stonk for 5000 credit! You now have "
-                    f"{userData[USERID]['stonks']} stonks.", mention_author=False)
-            else:
-                await msg.reply("You need 5000 credit to buy a stonk!", mention_author=False)
 
         return
 
@@ -271,15 +333,15 @@ async def on_message(msg: discord.Message) -> None:
         refMsgTime = refMsg.created_at.astimezone()
         elapsed = (now - refMsgTime).seconds
         if refMsg.author == msg.mentions[0] and 1200 <= elapsed <= 7200 and (
-                quietRole[msg.guild] in refMsg.author.roles):
+                quietRole[GID] in refMsg.author.roles):
             if random.random() >= 0.5: # only 50/50 chance to output the warning, since so many users aren't respecting this rn lmao
                 await msg.reply(
                     "FYI, this user doesn't want to get pinged by Replies!\nYou can hold Shift "
                     "when clicking Reply to disable the ping", mention_author=True)
             # transfer some credit from the offender to the victim, in compensation
             # silently, so people maxxing negative credit don't spam this
-            await updateCredit(msg.author.id, credit=-10, treason=1)
-            await updateCredit(refMsg.author.id, credit=10)
+            await updateCredit(GID, UID, credit=-10, treason=1)
+            await updateCredit(GID, refMsg.author.id, credit=10)
 
     # De-obscure links first, forgoing all other features (we want to discourage hiding links)
     linkSearch = re.search(r"\[(.+)\]\((\w+://)((?:[a-z0-9-]+\.)+\w+)(.*)\)", contentL)
@@ -288,30 +350,36 @@ async def on_message(msg: discord.Message) -> None:
             "Please don't mask links with markdown in this server, thanks! That link leads to "
             f"{linkSearch.group(3)}{linkSearch.group(4)}", mention_author=True)
         # one auto silent bad bot, so people maxxing negative credit don't spam this
-        await updateCredit(msg.author.id, credit=-15, treason=1)
+        await updateCredit(GID, UID, credit=-15, treason=1)
 
     # Check good/bad/"any" bots - can have any leading/trailing words as long as 2nd one is "bot"
     # Or can start with "good"/"bad"/"medium" and have precisely one trailing word
-    elif (len(splitL) > 1 and splitL[1] == "bot" and splitL[0] not in ["a", "the", "this"]) or (
+    elif (len(splitL) > 1 and splitL[1] == "bot" and splitL[0] not in ["a", "the", "this", "your"]) or (
             len(splitL) == 2 and splitL[0] in ["good", "bad", "medium"]):
         # Let sentiment analysis decide whether vote is positive or negative
         sentiment = sentimentAnalysis(msg.content)
-        # good/bad bots are worth +/-3 credit base, so add 5x mult before channel mult
-        # so manual votes are worth 15 credit before channel mult. This still seems kinda devalued
-        # compared to Sbeve votes, but there's no vote limit now so maybe it balances out
+        # good/bad bots are worth +/-3 credit base, so add 5x mult so default votes are worth 15
+        # This still seems kinda devalued compared to Sbeve votes, but there's no vote limit now
         credit = convertSentiment(sentiment) * 5 * creditMult
         target = await findVoteTarget(msg)
         if target is not None:
-            name = getAuthorMember(target).nick
-            await updateCredit(target.author.id, credit=credit, name=name)
-            #TODO if quietRole[msg.guild] in target.author.roles:
-            #     await target.channel.send(
-            #         f"Thank you for voting on {name}! "
-            #         f"They now have {userData[target.author.id]["credit"]} social credit.")
-            # else:
-            #     await target.channel.send(
-            #         f"Thank you for voting on {target.author.mention}! "
-            #         f"They now have {userData[target.author.id]["credit"]} social credit.")
+            TID = str(target.author.id)
+            await updateCredit(GID, TID, credit=credit)
+            if quietRole[GID] in target.author.roles:
+                if userData[GID][TID]["name"] != "":
+                    name = userData[GID][TID]["name"]
+                else:
+                    member = getAuthorMember(target)
+                    name = member.nick if member.nick is not None else member.name
+                    await updateCredit(GID, TID, name=name)
+
+                await target.channel.send(
+                    f"Thank you for voting on {name}! "
+                    f"They now have {userData[GID][TID]['credit']} social credit.")
+            else:
+                await target.channel.send(
+                    f"Thank you for voting on {target.author.mention}! "
+                    f"They now have {userData[GID][TID]['credit']} social credit.")
 
     # Scan for short message triggers, if present handle those and return without further processing
     # Also results in messages needing to be a minimum length of 25 chars for sentiment analysis.
@@ -323,7 +391,7 @@ async def on_message(msg: discord.Message) -> None:
                 await msg.channel.send("It is Wednesday, my dudes")
             else:
                 await msg.channel.send(
-                    f"It is currently {now.strftime("%H:%M %Z")}!")
+                    f"It is currently {now.strftime('%H:%M %Z')}!")
 
         # If stripped msg is in the what wordlist or is empty, trigger bot's "what" response
         # Exclude messages with embeds/attachments/references as user might be reacting to those
@@ -360,8 +428,7 @@ async def on_message(msg: discord.Message) -> None:
         sentiment = sentimentAnalysis(msg.content)
         credit = convertSentiment(sentiment) * creditMult
         await updateCredit(
-            msg.author.id, credit=credit, treason=min(1, treasonCount),
-            date=now.strftime("%Y-%m-%d"))
+            GID, UID, credit=credit, treason=min(1, treasonCount), date=now.strftime("%Y-%m-%d"))
 
         # roughly 10% chance to save current data to disk, in case of power failure, etc.
         # yes i know it's not actually a 10% chance due to message IDs being snowflakes but shhh
@@ -402,31 +469,31 @@ def convertSentiment(sentiment: float) -> int:
 
 
 async def findVoteTarget(msg: discord.Message) -> discord.Message | None: #TODO testing
-    """Given {msg}, find the target message that {msg} is voting on. If {msg} is a reply, then
+    """Given {msg}, find the target message that {msg} is voting on. If {msg} is a Reply, then
     this is very easy, but limit voting in this way to messages sent within the past day, and only
     once, to avoid infinite vote chains on the same message or on all prior messages sent by a user.
 
-    If {msg} is not a reply, look through channel history for the first message that isn't a bot
+    If {msg} is not a Reply, look through channel history for the first message that isn't a bot
     response to a vote, nor is another user voting the same message."""
-    # Implement vote-replying, and subsequent chained votes will continue to vote on the same target
+    # Implement vote-Replying, and subsequent chained votes will continue to vote on the same target
     if msg.reference is not None:
         trgtMsg = await msg.channel.fetch_message(msg.reference.message_id)
         if trgtMsg.created_at.day >= msg.created_at.day - 1 and not any(
                 reaction.me for reaction in trgtMsg.reactions):
             # Reply-voting bypasses voting-on-self guards, so check it here
             if trgtMsg.author.id == msg.author.id:
-                #TODO await msg.reply(
-                    # "You can only vote on messages sent by other users!", mention_author=False)
+                await msg.reply(
+                    "You can only vote on messages sent by other users!", mention_author=False)
                 return None
             else:
-                # add a reaction to target to track reply-vote usage, then return it
+                # add a reaction to target to track Reply-vote usage, then return it
                 await trgtMsg.add_reaction("\N{eye}")
                 return trgtMsg
         else:
-            #TODO await msg.reply(
-            #     "You can only vote via reply on messages sent since 12 AM yesterday, and messages "
-            #     "can only get reply-voted once (follow-up votes will continue that vote chain).",
-            #     mention_author=False)
+            await msg.reply(
+                "You can only vote via Reply on messages sent since 12 AM yesterday, and messages "
+                "can only get Reply-voted once (follow-up votes will continue that vote chain).",
+                mention_author=False)
             return None
 
     else:
@@ -438,33 +505,33 @@ async def findVoteTarget(msg: discord.Message) -> discord.Message | None: #TODO 
                 first = False
                 continue
 
-            # If current trgtMsg is a reply, keep track of the message it's replying to
+            # If current trgtMsg is a Reply, keep track of the message it's Replying to
             elif not trgtMsg.author.bot and trgtMsg.reference is not None:
                 derefMsg = await msg.channel.fetch_message(trgtMsg.reference.message_id)
 
             # Check if this trgtMsg is a vote or the bot's response to a vote
             contentL = trgtMsg.content.lower()
             splitL = contentL.split()
-            if (len(splitL) > 1 and splitL[1] == "bot" and splitL[0] not in ["a", "the", "this"]) or (
+            if (len(splitL) > 1 and splitL[1] == "bot" and splitL[0] not in ["a", "the", "this", "your"]) or (
                     len(splitL) == 2 and splitL[0] in ["good", "bad", "medium"]) or (
                     trgtMsg.author.bot and re.search(r"^(?:thank )?you (?:for|can) (?:voting|only) (?:on|vote) ", contentL)):
 
                 # If the voter is trgtMsg's author, voter already voted on the message
                 if trgtMsg.author.id == msg.author.id:
-                    #TODO await msg.reply("You can only vote on a message once!", mention_author=False)
+                    await msg.reply("You can only vote on a message once!", mention_author=False)
                     return None
 
                 # If trgtMsg is a vote or response and derefMsg exists, the target is derefMsg:
-                # this block enters the first time a vote is cast that's replying to derefMsg (since
-                # derefMsg can't be set by a bot, a reply-vote will always enter this block first).
+                # this block enters the first time a vote is cast that's Replying to derefMsg (since
+                # derefMsg can't be set by a bot, a Reply-vote will always enter this block first).
                 # If trgtMsg is NOT a vote or response, the parent block doesn't enter, so we can
                 # still vote on messages that happen to be replies (and not their reference message)
                 elif derefMsg is not None:
-                    # Follow-up votes on a reply-vote bypass voting-on-self guards, so check it here
+                    # Follow-up votes on a Reply-vote bypass voting-on-self guards, so check it here
                     if derefMsg.author.id == msg.author.id:
-                        #TODO await msg.reply(
-                            # "You can only vote on messages sent by other users!",
-                            # mention_author=False)
+                        await msg.reply(
+                            "You can only vote on messages sent by other users!",
+                            mention_author=False)
                         return None
                     else:
                         return derefMsg
@@ -478,7 +545,7 @@ async def findVoteTarget(msg: discord.Message) -> discord.Message | None: #TODO 
             else:
                 return trgtMsg
 
-    return None # Only get here if the history limit is reached, or multiple users are reply-voting
+    return None # Only get here if the history limit is reached, or multiple users are Reply-voting
 
 
 def getAuthorMember(msg: discord.Message) -> discord.Member:
@@ -489,23 +556,28 @@ def getAuthorMember(msg: discord.Message) -> discord.Member:
 
 
 async def updateCredit(
-    userID: int, credit: int=0, treason: int=0, stonks: int=0, name: str=None, date: str=None) -> None:
+    guildID: int|str, userID: int|str,
+    credit: int=0, treason: int=0, stonks: int=0, name: str=None, date: str=None) -> None:
     """Update user social credit in async-safe way. credit should be a positive or negative integer,
     the amount by which to modify the user's social credit. Likewise for treason and stonks.
     name and date are purely informational fields, which get populated over time, to help users read
     the stats file and make sense of it at a glance."""
-    USERID = str(userID) # Convert to string, because the keys in the stats file are all strings
+    GID = str(guildID) # Convert to string, because JSON keys are always strings
+    UID = str(userID)
     async with dataLock:
         global userData
-        if USERID not in userData:
-            userData[USERID] = {"credit": 0, "treason": 0, "stonks": 0, "name": "", "lastUpdate": ""}
-        userData[USERID]["credit"] += credit
-        userData[USERID]["treason"] += treason
-        userData[USERID]["stonks"] += stonks
+        if GID not in userData:
+            userData[GID] = {}
+        if UID not in userData[GID]:
+            userData[GID][UID] = {"credit": 0, "treason": 0, "stonks": 0, "name": "", "lastUpdate": ""}
+
+        userData[GID][UID]["credit"] += credit
+        userData[GID][UID]["treason"] += treason
+        userData[GID][UID]["stonks"] += stonks
         if name is not None:
-            userData[USERID]["name"] = name
+            userData[GID][UID]["name"] = name
         if date is not None:
-            userData[USERID]["lastUpdate"] = date
+            userData[GID][UID]["lastUpdate"] = date
 
 
 async def readCreditFromDisk() -> None:
