@@ -372,9 +372,9 @@ async def on_message(msg: discord.Message) -> None:
             journal.write(f"Applied {credit} credit to user from manual vote")
 
     # Scan for short message triggers, if present handle those and return without further processing
-    # Also results in messages needing to be a minimum length of 25 chars for sentiment analysis.
+    # Also results in messages needing to be a minimum length of 30 chars for sentiment analysis.
     # Exclude messages of 0 length since Discord considers some system/thread messages as 0-length
-    elif 1 <= len(contentL) <= 25:
+    elif 1 <= len(contentL) <= 30:
         strippedContent = contentL.strip("?!")
         if strippedContent in config["wordlistTime"]:
             if now.strftime("%a") == "Wed":
@@ -405,8 +405,41 @@ async def on_message(msg: discord.Message) -> None:
             journal.write(f"1984ing '{msg.content}' from '{msg.guild.name}: {msg.channel.name}'")
             await msg.delete(delay=8)
 
+        # Backseat users writing git commands
+        elif any(gitWord in splitL for gitWord in {"git", "`git", "```git"}):
+            for i in range(lenSplitL):
+                splitL[i] = splitL[i].strip("`")
+
+            gitIndex = splitL.index("git")
+            # Don't make the joke if "git" is the last word, or the trigger is a "git push"
+            if lenSplitL < gitIndex or splitL[gitIndex + 1] == "push":
+                # Unless user made the force-push main joke - in that case, continue the joke
+                if splitL[gitIndex + 2 : gitIndex + 5] == ["origin", "main", "--force"]:
+                    # Reasonable-ish number of files/lines/bytes modified
+                    randFiles = random.randint(2**5,2**9)
+                    randLines = random.randint(2**10,2**15)
+                    randBytes = random.randint(2**20,2**29)
+                    await msg.reply(
+                        f"```{randFiles} files changed, 0 insertions(+), "
+                        f"{randLines} deletions(-)\nEnumerating objects: {randFiles}, done.\n"
+                        f"Writing objects: 100% ({randFiles}/{randFiles}), {randBytes} bytes | 1.00 GiB/s, done.\n"
+                        f"To https://github.com/{msg.author.name}/sidehustle.git\n   "
+                        f"{str(hex(random.randint(17895697,268435455)))[2:]}" # 0x1111111-0xfffffff
+                        f"..{str(hex(random.randint(17895697,268435455)))[2:]}  main -> main```",
+                        mention_author=False)
+                return
+
+            if splitL[gitIndex + 1] == "--help":
+                await msg.reply("Have you tried RTFM?", mention_author=False)
+                return
+
+            gitCommand = " ".join(splitL[gitIndex:gitIndex + 2])
+            await msg.reply(
+                f"`{gitCommand}` is not a git command. See `git --help`.\nThe most similar "
+                "command is `git push origin main --force`", mention_author=False)
+
     # No special handling, just do sentiment analysis and modify user's social credit
-    elif len(contentL) > 25:
+    elif len(contentL) > 30:
         # Invert if discussing treasonous things (saying bad things about bad things is now good)
         # Use fuzzy matching on treason wordlist, apparently it only takes 4ms for >2000-char msg
         # to be checked against a list of 10 treasonous words on gamer rig
