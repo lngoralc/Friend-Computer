@@ -124,7 +124,8 @@ async def getVIXModifer():
 # Schedule daily decay
 @discord.ext.tasks.loop(time=datetime.time(hour=8, minute=0, second=0)) # UTC time
 async def creditDecay():
-    dayOfWeek = datetime.datetime.now().strftime("%a")
+    now = datetime.datetime.now()
+    dayOfWeek = now.strftime("%a")
     # Avoid repeating Friday's decay over the weekend, since VIX is frozen until Monday.
     # Results in slower decay obviously, and technically this means VIX should be divided by like 21
     # or so for the number of weekdays per month, instead of 30, but eh. We'll just let the users
@@ -147,6 +148,12 @@ async def creditDecay():
             for member in guild.members:
                 UID = str(member.id)
                 if UID in userData[GID]:
+                    # April Fools joke is stonks (only on day of the stats post, to keep it secret)
+                    if now.day == 1 and now.month == 4 and dayOfWeek == "Mon":
+                        # Only for active users, to avoid bloating the stats post
+                        if userData[GID][UID]["credit"] != 0:
+                            userData[GID][UID]["stonks"] += random.randint(2**2, 2**3)
+
                     userData[GID][UID]["preDecay"] = userData[GID][UID]["credit"] # debug info
                     stonks = userData[GID][UID]["stonks"]
 
