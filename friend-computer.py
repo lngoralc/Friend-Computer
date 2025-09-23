@@ -288,8 +288,10 @@ async def on_message(msg: discord.Message) -> None:
         if command == "help":
             await msg.reply(
                 "Vote on messages by sending any 2 or 3 word message where the first word is one of "
-                "[good/bad/medium], or sending a 2+ word message where the second word is 'bot'. "
-                "You can also Reply to a message to vote on it, and subsequent votes will continue to vote on the "
+                "`good/fantastic/bad/awful/medium/mediocre`, or by sending a 2+ word message where "
+                "the 2nd or 3rd word is `bot`. Examples: `good bot for (convoluted reason here)`, "
+                "`bad fashion design`, `mildly ambiguous bot`, `mediocre mediocrity`.\nYou can also "
+                "Reply to a message to vote on it, and subsequent votes will continue to vote on the "
                 "referenced message. This only works once and only on recent messages, to avoid abuse."
                 "\nCredit slightly decays daily, and is also tied to the Cboe Volatility Index - "
                 "higher stock market volatility means higher credit, so when your real investments "
@@ -350,8 +352,7 @@ async def on_message(msg: discord.Message) -> None:
 
     # Check good/bad/"any" bots - can have any leading/trailing words as long as 2nd one is "bot"
     # Or can start with "good"/"bad"/"medium" and have precisely one trailing word
-    if (lenSplitL > 1 and splitL[1] == "bot" and splitL[0] not in ["a", "the", "this", "your"]) or (
-            2 <= lenSplitL <= 3 and splitL[0] in ["good", "bad", "medium"]):
+    if isVote(lenSplitL, splitL):
         # Let sentiment analysis decide whether vote is positive or negative
         sentiment = sentimentAnalysis(msg.content)
         # good/bad bots are worth +/-3 credit base, so add 5x mult so default votes are worth 15
@@ -470,6 +471,13 @@ async def on_message(msg: discord.Message) -> None:
             await writeCreditToDisk()
 
 
+def isVote(lenSplitL: int, splitL: list) -> bool:
+    """"Checks if a message is in valid vote syntax - methodified since is used more than once."""
+    return ((lenSplitL > 1 and splitL[1] == "bot" or lenSplitL > 2 and splitL[2] == "bot") and 
+        splitL[0] not in ["a", "the", "this", "your"]) or (
+        2 <= lenSplitL <= 3 and splitL[0] in ["good", "fantastic", "bad", "awful", "medium", "mediocre"])
+
+
 def sentimentAnalysis(content: str) -> float:
     """Analyzes sentiment of {content}, which is a float between 0 (negative) and 1 (positive).
     The ^vibe command outputs this value, and convertSentiment (into credit) uses this as input."""
@@ -548,8 +556,7 @@ async def findTarget(msg: discord.Message, vibeCheck: bool=False) -> discord.Mes
             contentL = trgtMsg.content.lower()
             splitL = contentL.split()
             lenSplitL = len(splitL)
-            if (lenSplitL > 1 and splitL[1] == "bot" and splitL[0] not in ["a", "the", "this", "your"]) or (
-                    2 <= lenSplitL <= 3 and splitL[0] in ["good", "bad", "medium"]) or (
+            if isVote(lenSplitL, splitL) or (
                     trgtMsg.author.bot and re.search(r"^(?:thank )?you (?:for|can) (?:voting|only) (?:on|vote) ", contentL)):
 
                 # If the voter is trgtMsg's author, voter already voted on the message
