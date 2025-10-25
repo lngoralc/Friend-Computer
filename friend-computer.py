@@ -13,7 +13,6 @@ import random
 import re
 import sys
 from systemd import journal
-# import tensorflow
 from tensorflow import keras
 import tensorflow_datasets # needed by tokenizer.pickle, even though it looks unused
 import ai_edge_litert.interpreter
@@ -40,7 +39,10 @@ except FileNotFoundError:
             "wordlistWhat": ["what", "wat", "wut", "huh", "nani"],
             "wordlistTreason": [
                 "ai", "bitcoin", "blockchain", "cryptocoin", "cryptocurrency", "nft",
-                "authoritarian", "colonial", "dictator", "fascist", "treason"]
+                "authoritarian", "colonial", "dictator", "fascist", "treason"],
+            "wordlistVote": [
+                "good", "great", "fantastic", "bad", "horrible", "awful", "medium", "mediocre",
+                "lukewarm"]
         }, file, indent=4, ensure_ascii=False)
         sys.exit(
             "Config file not found. Default config has been created at config/config.json. "
@@ -103,7 +105,7 @@ quietRole = {}
 announceChannel = {}
 
 
-async def getVIXModifer():
+async def getVIXModifer() -> float:
     try:
         # Fetch Volatility Index (VIX) dataset, skipping most history, getting date and CoB value
         vixHistory = None
@@ -123,7 +125,7 @@ async def getVIXModifer():
 
 # Schedule daily decay
 @discord.ext.tasks.loop(time=datetime.time(hour=8, minute=0, second=0)) # UTC time
-async def creditDecay():
+async def creditDecay() -> None:
     now = datetime.datetime.now()
     dayOfWeek = now.strftime("%a")
     # Avoid repeating Friday's decay over the weekend, since VIX is frozen until Monday.
@@ -153,6 +155,10 @@ async def creditDecay():
                         # Only for active users, to avoid bloating the stats post
                         if userData[GID][UID]["credit"] != 0:
                             userData[GID][UID]["stonks"] += random.randint(2**2, 2**3)
+                    # Christmas present is a stonk each, likewise only on day of stats post
+                    elif now.day == 25 and now.month == 12 and dayOfWeek == "Mon":
+                        if userData[GID][UID]["credit"] != 0:
+                            userData[GID][UID]["stonks"] += 1
 
                     userData[GID][UID]["preDecay"] = userData[GID][UID]["credit"] # debug info
                     stonks = userData[GID][UID]["stonks"]
@@ -288,7 +294,7 @@ async def on_message(msg: discord.Message) -> None:
         if command == "help":
             await msg.reply(
                 "Vote on messages by sending any 2 or 3 word message where the first word is one of "
-                "`good/fantastic/bad/awful/medium/mediocre`, or by sending a 2+ word message where "
+                f"`{config['wordlistVote']}`, or by sending a 2+ word message where "
                 "the 2nd or 3rd word is `bot`. Examples: `good bot for (convoluted reason here)`, "
                 "`bad fashion design`, `mildly ambiguous bot`, `mediocre mediocrity`.\nYou can also "
                 "Reply to a message to vote on it, and subsequent votes will continue to vote on the "
@@ -475,7 +481,7 @@ def isVote(lenSplitL: int, splitL: list) -> bool:
     """"Checks if a message is in valid vote syntax - methodified since is used more than once."""
     return ((lenSplitL > 1 and splitL[1] == "bot" or lenSplitL > 2 and splitL[2] == "bot") and 
         splitL[0] not in ["a", "the", "this", "your"]) or (
-        2 <= lenSplitL <= 3 and splitL[0] in ["good", "fantastic", "bad", "awful", "medium", "mediocre"])
+        2 <= lenSplitL <= 3 and splitL[0] in config["wordlistVote"])
 
 
 def sentimentAnalysis(content: str) -> float:
@@ -517,7 +523,8 @@ async def findTarget(msg: discord.Message, vibeCheck: bool=False) -> discord.Mes
 
     If {msg} is not a Reply, look through channel history for the first message that isn't a bot
     response to a vote, nor is another user voting the same message."""
-    # Implement vote-Replying, and subsequent chained votes will continue to vote on the same target
+    # Implement vote-Replying
+    # Subsequent chained votes will continue to vote on the same target due to else-block logic
     if msg.reference is not None and not msg.flags.forwarded:
         trgtMsg = await msg.channel.fetch_message(msg.reference.message_id)
         if vibeCheck or trgtMsg.created_at.day >= msg.created_at.day - 1 and not any(
@@ -564,11 +571,12 @@ async def findTarget(msg: discord.Message, vibeCheck: bool=False) -> discord.Mes
                     await msg.reply("You can only vote on a message once!", mention_author=False)
                     return None
 
-                # If trgtMsg is a vote or response and derefMsg exists, the target is derefMsg:
-                # this block enters the first time a vote is cast that's Replying to derefMsg (since
-                # derefMsg can't be set by a bot, a Reply-vote will always enter this block first).
+                # If trgtMsg is a vote and derefMsg exists, then the target is derefMsg.
+                # If trgtMsg is a response, then derefMsg can't exist since it can't be set by bots.
+                # Thus this block enters when trgtMsg is a Reply-vote (itself voting on derefMsg).
                 # If trgtMsg is NOT a vote or response, the parent block doesn't enter, so we can
                 # still vote on messages that happen to be replies (and not their reference message)
+                # by falling through to the else-block near the bottom of this method.
                 elif derefMsg is not None:
                     # Follow-up votes on a Reply-vote bypass voting-on-self guards, so check it here
                     if derefMsg.author.id == msg.author.id:
