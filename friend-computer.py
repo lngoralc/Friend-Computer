@@ -410,18 +410,27 @@ async def on_message(msg: discord.Message) -> None:
         # Exclude messages with embeds/attachments/references as user might be reacting to those
         elif len(msg.attachments) == 0 and len(msg.embeds) == 0 and msg.reference is None and (
                 strippedContent in config["wordlistWhat"] or not strippedContent):
-            try:
-                # Convert recent channel history into list of messages and get second last
-                target = [oldMsg async for oldMsg in msg.channel.history(limit=2)][-1]
-                if target.author == msg.author:
-                    return # don't trigger on user's own messages
-                # Strip existing bolding from the target msg, so we can make the response be bolded
+
+            # Convert recent channel history into list of messages and get second last
+            target = [oldMsg async for oldMsg in msg.channel.history(limit=2)][-1]
+            if target.author == msg.author:
+                return # don't trigger on user's own messages
+
+            # Two possibilities, either the target has message content, so we yell it again
+            # Or it doesn't, and the msg is reacting to some kind of embed in target
+            if len(target.content) > 0:
+                # Strip existing bolding from target msg, so we can make the response bold
                 target = target.content.replace("**","").upper() # all caps letsgo
                 await msg.channel.send(f"**{target}**")
 
-            except Exception as e:
+            elif target.reference is not None or len(target.attachments) > 0 or len(
+                    target.embeds) > 0:
+                # If target has attachments, make a list of embeds rather than re-uploading Files
+                # (Bot doesn't have perms to attach files right now anyway)
+                attchEmbeds = [
+                    discord.Embed().set_image(url=attach.url) for attach in target.attachments]
                 await msg.channel.send(
-                    "**I TRIED TO RETRIEVE THE PREVIOUS MESSAGE TO CAPITALIZE IT BUT I BROKE INSTEAD**")
+                    embeds=target.embeds or attchEmbeds or None, reference=target.reference)
 
         # If message contains the word "1984" with up to one added character, censor it with minimal delay
         elif any(fuzz.ratio("1984", msgWord) > 88 for msgWord in splitL):
