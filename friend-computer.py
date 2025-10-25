@@ -263,7 +263,16 @@ async def on_message(msg: discord.Message) -> None:
         command = msg.content[1:]
         journal.write(f"{command} command issued in '{msg.guild.name}: {msg.channel.name}'")
         if getAuthorMember(msg).guild_permissions.administrator:
-            if command.startswith("purge"):
+            if command == "debug":
+                if msg.reference is None:
+                    trgt = [_ async for _ in msg.channel.history(limit=2)][-1]
+                else:
+                    trgt = await findTarget(msg, directDeref=True)
+                await msg.reply(
+                    f"Length: {len(trgt.content)}\nRef: {trgt.reference}\nEmbeds: {trgt.embeds}\n"
+                    f"Attachments: {trgt.attachments}\nFlags: {trgt.flags}", mention_author=False)
+
+            elif command.startswith("purge"):
                 try:
                     amount = min(int(command.split()[1]) + 1, 25) # factor in ^purge msg, max of 25
                 except:
@@ -349,7 +358,7 @@ async def on_message(msg: discord.Message) -> None:
             if msg.reference is None:
                 trgt = [_ async for _ in msg.channel.history(limit=2)][-1]
             else:
-                trgt = await findTarget(msg, vibeCheck=True) # allow Reply-vibing messages
+                trgt = await findTarget(msg, directDeref=True) # allow Reply-vibing messages
             sentiment = sentimentAnalysis(trgt.content)
             refWord = "prior" if msg.reference is None else "Replied-to"
             await msg.reply(f"The {refWord} message's sentiment is: {sentiment}", mention_author=False)
@@ -516,7 +525,7 @@ def convertSentiment(sentiment: float) -> int:
     return 0
 
 
-async def findTarget(msg: discord.Message, vibeCheck: bool=False) -> discord.Message | None: #TODO testing
+async def findTarget(msg: discord.Message, directDeref: bool=False) -> discord.Message | None:
     """Given {msg}, find the target message that {msg} is voting on. If {msg} is a Reply, then
     this is very easy, but limit voting in this way to messages sent within the past day, and only
     once, to avoid infinite vote chains on the same message or on all prior messages sent by a user.
@@ -527,16 +536,16 @@ async def findTarget(msg: discord.Message, vibeCheck: bool=False) -> discord.Mes
     # Subsequent chained votes will continue to vote on the same target due to else-block logic
     if msg.reference is not None and not msg.flags.forwarded:
         trgtMsg = await msg.channel.fetch_message(msg.reference.message_id)
-        if vibeCheck or trgtMsg.created_at.day >= msg.created_at.day - 1 and not any(
-                reaction.me for reaction in trgtMsg.reactions):
+        numReacts = [reaction.me for reaction in trgtMsg.reactions].count(True)
+        if directDeref or trgtMsg.created_at.day >= msg.created_at.day - 1 and numReacts == 0:
             # Reply-voting bypasses voting-on-self guards, so check it here
-            if trgtMsg.author.id == msg.author.id and not vibeCheck:
+            if trgtMsg.author.id == msg.author.id and not directDeref:
                 await msg.reply(
                     "You can only vote on messages sent by other users!", mention_author=False)
                 return None
             else:
                 # add a reaction to target to track Reply-vote usage, then return it
-                if not vibeCheck:
+                if not directDeref:
                     await trgtMsg.add_reaction("\N{eye}")
                 return trgtMsg
         else:
@@ -544,9 +553,14 @@ async def findTarget(msg: discord.Message, vibeCheck: bool=False) -> discord.Mes
                 "You can only vote via Reply on messages sent since 12 AM yesterday, and messages "
                 "can only get Reply-voted once (follow-up votes will continue that vote chain).",
                 mention_author=False)
+            # add additional emoji so we can prevent follow-up votes from working after this block
+            if numReacts < 1:
+                await trgtMsg.add_reaction("\N{eye}")
+            if numReacts < 2: # NOT elif since we need both reactions to block further chained votes
+                await trgtMsg.add_reaction("\N{nazar amulet}")
             return None
 
-    else:
+    elif not directDeref:
         first = True
         derefMsg = None
         async for trgtMsg in msg.channel.history(limit=32):
@@ -584,19 +598,32 @@ async def findTarget(msg: discord.Message, vibeCheck: bool=False) -> discord.Mes
                             "You can only vote on messages sent by other users!",
                             mention_author=False)
                         return None
+                    # Follow-up votes on a blocked Reply-vote bypass other guards, so check here
+                    elif [reaction.me for reaction in derefMsg.reactions].count(True) > 1:
+                        await msg.reply(
+                            "You can only vote in a Reply-chain if the original Reply-vote was "
+                            "actually allowed.", mention_author=False)
+                        return None
                     else:
                         return derefMsg
 
                 continue
 
-            # Skip the author's own messages, so they can talk and then vote on the prior message
+            # Skip the author's own messages, so they can talk and then vote on the prior message,
+            # unless any messages are edited (to avoid allowing multiple votes from same user)
             elif trgtMsg.author.id == msg.author.id:
+                if trgtMsg.edited_at is not None:
+                    await msg.reply(
+                        "You can only vote on a prior message if you haven't edited any messages "
+                        "you sent after the prior message. Blame Francisco for making me add this.",
+                        mention_author=False)
+                    return None
                 continue
 
             else:
                 return trgtMsg
 
-    return None # Only get here if the history limit is reached, or multiple users are Reply-voting
+    return None # Only get here if the history limit is reached or directDeref is true when used on a msg that isn't a Reply
 
 
 def getAuthorMember(msg: discord.Message) -> discord.Member:
