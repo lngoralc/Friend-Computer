@@ -11,6 +11,7 @@ import pickle
 from rapidfuzz import fuzz
 import random
 import re
+import string
 import sys
 from systemd import journal
 from tensorflow import keras
@@ -35,11 +36,12 @@ except FileNotFoundError:
             "nameTfliteModel": "model.tflite",
             "nameTokenizer": "tokenizer.pickle",
             "quietRole": "Don'tPingMe",
+            "wordlistSwear": ["dang", "darn", "golly", "gosh", "heck", "hecking"],
             "wordlistTime": ["now", "time", "what time", "when"],
-            "wordlistWhat": ["what", "wat", "wut", "huh", "nani"],
             "wordlistTreason": [
                 "ai", "bitcoin", "blockchain", "cryptocoin", "cryptocurrency", "nft",
                 "authoritarian", "colonial", "dictator", "fascist", "treason"],
+            "wordlistWhat": ["what", "wat", "wut", "huh", "nani"],
             "wordlistVote": [
                 "good", "great", "fantastic", "bad", "horrible", "awful", "medium", "mediocre",
                 "lukewarm"]
@@ -398,18 +400,22 @@ async def on_message(msg: discord.Message) -> None:
     # Also results in messages needing to be a minimum length of 30 chars for sentiment analysis.
     # Exclude messages of 0 length since Discord considers some system/thread messages as 0-length
     elif 1 <= len(contentL) <= 30:
-        strippedContent = contentL.strip("?!")
-        if strippedContent in config["wordlistTime"]:
+        # Make copy of message with all punctuation removed to check against the wordlists
+        strippedContent = contentL.translate(str.maketrans('', '', string.punctuation))
+        if any(word in strippedContent.split() for word in config["wordlistSwear"]):
+            await msg.reply("Hey! We don't appreciate your swear words here!", mention_author=False)
+
+        elif strippedContent in config["wordlistTime"]:
             if now.strftime("%a") == "Wed":
                 await msg.channel.send("It is Wednesday, my dudes")
             else:
                 await msg.channel.send(
                     f"It is currently {now.strftime('%H:%M %Z')}!")
 
-        # If stripped msg is in the what wordlist or is empty, trigger bot's "what" response
+        # If stripped msg is in wordlist or msg only contains ? and/or !, trigger "what" response
         # Exclude messages with embeds/attachments/references as user might be reacting to those
         elif len(msg.attachments) == 0 and len(msg.embeds) == 0 and msg.reference is None and (
-                strippedContent in config["wordlistWhat"] or not strippedContent):
+                strippedContent in config["wordlistWhat"] or not contentL.strip("?!")):
 
             # Convert recent channel history into list of messages and get second last
             target = [oldMsg async for oldMsg in msg.channel.history(limit=2)][-1]
